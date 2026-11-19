@@ -98,7 +98,7 @@ namespace FSO.Android
             FileLogger.SetContext(ApplicationContext);
             var logDir = GetExternalFilesDir(null)?.AbsolutePath ?? FilesDir.AbsolutePath;
             FileLogger.Init(logDir);
-            FileLogger.Log("APP", "Blueberry FreeSO dimulai (versi 1.0-perbaikan-5.2)");
+            FileLogger.Log("APP", "Blueberry FreeSO dimulai (versi 1.0-perbaikan-5.3)");
             FileLogger.Log("APP", "HP: " + Build.Manufacturer + " " + Build.Model
                 + ", Android " + Build.VERSION.Release
                 + " (SDK " + (int)Build.VERSION.SdkInt + ")");
@@ -127,6 +127,9 @@ namespace FSO.Android
 
             // Perbaikan 5.2: TIDAK PERNAH auto-launch game lagi — selalu tampilkan
             // layar launcher dulu. Game baru jalan bila tombol Play ditekan.
+            // Perbaikan 5.3: game dijalankan Asynchronous (bukan Synchronous
+            // warisan PC) — loop digerakkan GLSurfaceView, Run() kembali
+            // langsung. Lihat BlueberryGame.Run() dan RunGame() di bawah.
             ShowLauncher();
         }
 
@@ -162,6 +165,15 @@ namespace FSO.Android
         protected override void OnDestroy()
         {
             base.OnDestroy();
+            // Perbaikan 5.3: dengan loop async, timer heartbeat/survival hidup
+            // selama game jalan (bukan dibuang di akhir RunGame) — di sinilah
+            // mereka dibuang, saat activity benar-benar hancur. _gameStarted
+            // juga direset di sini, bukan di RunGame: selagi game jalan,
+            // _gameStarted harus tetap true supaya Play tidak bisa memulai
+            // game kedua. (Bila game tidak pernah jalan, pemanggilan ini
+            // tidak berpengaruh — timer masih null, _gameStarted masih false.)
+            DisposeRunTimers();
+            _gameStarted = false;
             // Keluar normal setelah game jalan: matikan proses supaya buka
             // berikutnya selalu proses segar. State statis FSO (Content.INSTANCE
             // singleton, Game, GameFacade) tidak bisa dibuat ulang di proses
@@ -869,7 +881,10 @@ namespace FSO.Android
             // Heartbeat: tiap 10 detik tulis jejak (berapa detik game jalan +
             // LoadProgress konten) — bila crash native, baris terakhir di log
             // menunjukkan game sempat jalan berapa lama dan konten sampai mana.
-            // Timer jalan di thread pool (game.Run() memblokir UI thread).
+            // Timer jalan di thread pool dan TETAP HIDUP selama game jalan:
+            // dengan loop async, game.Run() kembali langsung (tidak memblokir
+            // UI thread lagi), jadi timer TIDAK boleh dibuang di akhir RunGame
+            // — dibuang di OnDestroy, saat activity benar-benar hancur.
             var runStartedUtc = DateTime.UtcNow;
             _heartbeatTimer = new System.Threading.Timer(_ =>
             {
@@ -959,7 +974,11 @@ namespace FSO.Android
                 // Di bawah ini hanya agar pembacaan file relatif (mis. blueprint.dtd) jalan.
                 Directory.SetCurrentDirectory(docs);
 
-                FSOEnvironment.GameThread = Thread.CurrentThread;
+                // FSOEnvironment.GameThread TIDAK diisi di sini lagi (perbaikan
+                // 5.3): RunGame jalan di UI thread, sedangkan tick game async
+                // jalan di thread render GLSurfaceView. Statik itu diisi di
+                // BlueberryGame.Initialize() — di thread tick yang sebenarnya,
+                // sebelum base.Initialize(). Lihat BlueberryGame.cs.
 
                 // Pesan error dari dalam game (mis. konten gagal dimuat) dicatat ke logcat.
                 // Di PC pesan ini muncul sebagai MessageBox; di Android belum ada UI dialognya.
@@ -992,27 +1011,47 @@ namespace FSO.Android
                 BlueberryGame game = new BlueberryGame();
                 GameFacade.DirectX = false;
                 World.DirectX = false;
+                // Sinyal keluar yang sesungguhnya (perbaikan 5.3): dengan loop
+                // async, game.Run() kembali LANGSUNG — bukan tanda game selesai.
+                // Game keluar nanti, saat user menekan Back di dalam game
+                // (TSOGame.OnExiting → Game.Exit() → event Exiting), lalu
+                // MonoGame menutup activity — barulah OnDestroy yang membereskan
+                // (MarkCleanExit + matikan proses). Event ini jalan di thread
+                // game; FileLogger thread-safe (satu lock), jadi aman dicatat
+                // dari sini.
+                game.Exiting += (sender, args) =>
+                    FileLogger.Log("RUN", "game keluar (Exiting) — loop async berhenti");
                 SetContentView((View)game.Services.GetService(typeof(View)));
                 FileLogger.Log("RUN", "SetContentView selesai");
-                FileLogger.Log("RUN", "game.Run() dipanggil");
+                FileLogger.Log("RUN", "game.Run() dipanggil (Asynchronous — kembali langsung, loop jalan sendiri)");
                 game.Run();
-                FileLogger.Log("RUN", "game.Run() kembali (keluar normal)");
-                GameCrashTracker.MarkCleanExit(this);
+                FileLogger.Log("RUN", "game.Run() kembali — loop async berjalan, activity tetap di tampilan game");
             }
-            finally
+            catch (Exception e)
             {
-                try { _heartbeatTimer?.Dispose(); } catch (Exception) { }
-                try { _survivalTimer?.Dispose(); } catch (Exception) { }
-                _heartbeatTimer = null;
-                _survivalTimer = null;
+                // Gagal SEBELUM loop jalan (setup / pemanggilan Run): game tidak
+                // jalan, jadi bersihkan state supaya Play bisa ditekan lagi,
+                // lalu lempar lagi supaya crash handler mencatatnya ke log.
+                FileLogger.LogError("RUN", e);
+                DisposeRunTimers();
                 _gameStarted = false;
+                throw;
             }
+            // TIDAK ada finally, TIDAK ada Finish() di sini: dengan loop async,
+            // RunGame selesai begitu loop dimulai; activity tetap hidup di
+            // tampilan game sampai user keluar (Back). Timer heartbeat/survival
+            // tetap hidup selama game jalan dan dibuang di OnDestroy.
+            // MarkCleanExit juga TIDAK di sini lagi — tempatnya di OnDestroy,
+            // saat game benar-benar sudah keluar.
+        }
 
-            // Game keluar normal: tutup activity — OnDestroy mematikan proses
-            // supaya buka berikutnya selalu proses segar (lihat OnDestroy).
-            // Bila activity sudah finishing (MonoGame menutupnya sendiri),
-            // Finish() tidak berpengaruh.
-            if (!IsFinishing) Finish();
+        /// <summary>Buang timer heartbeat + survival (dipakai saat setup gagal dan di OnDestroy).</summary>
+        private void DisposeRunTimers()
+        {
+            try { _heartbeatTimer?.Dispose(); } catch (Exception) { }
+            try { _survivalTimer?.Dispose(); } catch (Exception) { }
+            _heartbeatTimer = null;
+            _survivalTimer = null;
         }
 
         /// <summary>

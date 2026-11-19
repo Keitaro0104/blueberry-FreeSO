@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
@@ -75,6 +76,27 @@ namespace FSO.Android
             Log("CRASH", "Aplikasi crash (" + source + "):");
             if (exceptionObject is Exception e) LogError("CRASH", e);
             else Log("CRASH", exceptionObject?.ToString() ?? "(tidak ada detail)");
+        }
+
+        /// <summary>
+        /// Daftar _id baris MediaStore yang namanya sama dengan file log — untuk
+        /// dihapus sebelum insert baru (perbaikan 5.3). Logika murni (tanpa API
+        /// Android) supaya bisa diuji di VM: query MediaStore Downloads TIDAK
+        /// boleh memakai selection "display_name = ?" (provider menolak kolom
+        /// itu — "Invalid column display_name" di log HP 21:37), jadi hapus
+        /// file lama dilakukan dengan query tanpa selection lalu saring nama
+        /// di kode. Perbandingan nama persis (case-sensitive), sama seperti
+        /// selection "=" yang dulu dipakai.
+        /// </summary>
+        internal static List<long> OldLogFileIds(IEnumerable<(long Id, string DisplayName)> rows)
+        {
+            var result = new List<long>();
+            if (rows == null) return result;
+            foreach (var row in rows)
+            {
+                if (row.DisplayName == LogFileName) result.Add(row.Id);
+            }
+            return result;
         }
 
         /// <summary>Baca N karakter terakhir file log (untuk dialog "Lihat Log").</summary>

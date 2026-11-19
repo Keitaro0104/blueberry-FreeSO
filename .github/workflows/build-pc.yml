@@ -1,0 +1,25 @@
+name: Build PC (net9)
+
+on:
+  push:
+    branches: [dotnet9-opt]
+    paths: ['TSOClient/**', 'Other/libs/**', '.github/workflows/build-pc.yml']
+  pull_request:
+    branches: [dotnet9-opt]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Build solusi net9
+        run: dotnet build TSOClient/FreeSO.net9.sln -c Release
+      - name: Simpan hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FSO-Windows-net9
+          path: TSOClient/FSO.Windows/bin/Release/

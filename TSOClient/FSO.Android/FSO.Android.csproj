@@ -12,6 +12,37 @@
   <ItemGroup>
     <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.4" />
     <PackageReference Include="MonoGame.Framework.Android" Version="3.8.4" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <!--
+      Stub.System.Data.SQLite.Core.NetStandard (transitif dari FSO.Server.Database)
+      membawa aset native runtimes/linux-x64/native/SQLite.Interop.dll (file ELF
+      bernama .dll). Saat publish Android, file itu ikut masuk daftar "file .dll"
+      dan ProcessAssemblies mencoba membacanya sebagai assembly .NET -> error
+      XAPRAS7009 ("PE image does not have metadata"). Game di Android tidak
+      membuka database SQLite server, jadi aset native-nya dibuang di sini saja;
+      assembly managed System.Data.SQLite.dll tetap ada. Proyek PC tidak disentuh.
+    -->
+    <PackageReference Include="Stub.System.Data.SQLite.Core.NetStandard" Version="1.0.119" ExcludeAssets="native" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\tso.client\FSO.Client.csproj" />
+    <ProjectReference Include="..\tso.common\FSO.Common.csproj" />
+    <ProjectReference Include="..\tso.files\FSO.Files.csproj" />
+    <ProjectReference Include="..\tso.content\FSO.Content.csproj" />
+    <ProjectReference Include="..\tso.simantics\FSO.SimAntics.csproj" />
+    <ProjectReference Include="..\FSO.UI\FSO.UI.csproj" />
+  </ItemGroup>
+  <!--
+    Konten game terkompilasi (efek, font, tekstur — 19 MB dari TSOClient/tso.content/Content)
+    dipaketkan sebagai aset APK dengan jalur yang sama seperti di PC ("Content/..."),
+    supaya MonoGame ContentManager (RootDirectory "Content/OGL/") dan pembacaan File IO
+    (FSOEnvironment.ContentDir, setelah disalin ke storage saat pertama jalan) menemukannya.
+    Konten besar FSO.Content.TSO (Objects/, ~288 MB) BELUM dipaketkan — Langkah 5.
+  -->
+  <ItemGroup>
+    <AndroidAsset Include="..\tso.content\Content\**\*">
+      <LogicalName>Content/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
+    </AndroidAsset>
   </ItemGroup>
   <Target Name="RestoreDotnetTools" BeforeTargets="CollectPackageReferences">
     <Message Text="Restoring dotnet tools (this might take a while depending on your internet speed and should only happen upon building your project for the first time, or after upgrading MonoGame, or clearing your nuget cache)" Importance="High" />

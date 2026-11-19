@@ -62,15 +62,65 @@ namespace FSO.Android
             Run(GameRunBehavior.Asynchronous);
         }
 
+        /// <summary>
+        /// True sejak Tick pertama jalan (Update pertama dipanggil).
+        /// Dipakai Activity1 untuk tahu apakah Back boleh diteruskan ke
+        /// game (sudah Tick — game yang menangani) atau harus keluar paksa
+        /// (belum Tick — game tidak akan pernah merespons Back, karena
+        /// tombol Back ditelan game view jadi GamePad.Back yang hanya dibaca
+        /// di Update). Static karena dibaca dari Activity1; proses
+        /// dimatikan saat keluar (perbaikan 5.2), jadi tidak perlu di-reset.
+        /// </summary>
+        public static volatile bool HasTicked = false;
+
+        private bool _updateLogged = false;
+        private bool _drawLogged = false;
+
+        /// <summary>
+        /// Perbaikan 5.4 — visibilitas loop: catat Update pertama.
+        /// Update hanya jalan bila Tick jalan; baris ini di log HP adalah
+        /// bukti loop MonoGame hidup (sebelum 5.4 tidak ada Tick sama sekali
+        /// dalam 10 detik setelah Play). base.Update memanggil
+        /// TSOGame.Update (tso.client/TSOGame.cs:366).
+        /// </summary>
+        protected override void Update(GameTime gameTime)
+        {
+            if (!_updateLogged)
+            {
+                _updateLogged = true;
+                HasTicked = true;
+                FileLogger.Log("RUN", "Update pertama — Tick jalan");
+            }
+            base.Update(gameTime);
+        }
+
+        /// <summary>
+        /// Perbaikan 5.4 — visibilitas loop: catat Draw pertama (frame
+        /// pertama tampil). Draw jalan sesudah Update di Tick yang sama.
+        /// TSOGame tidak meng-override Draw, jadi base.Draw langsung ke
+        /// Game.Draw milik MonoGame.
+        /// </summary>
+        protected override void Draw(GameTime gameTime)
+        {
+            if (!_drawLogged)
+            {
+                _drawLogged = true;
+                HasTicked = true;
+                FileLogger.Log("RUN", "Draw pertama — frame pertama tampil");
+            }
+            base.Draw(gameTime);
+        }
+
         protected override void Initialize()
         {
             // Perbaikan 5.3 — arahkan statik thread game ke thread tick yang
             // sebenarnya, SEBELUM base.Initialize() menjalankan kode apa pun
             // yang memakai statik itu.
             //
-            // Dengan loop async, Tick (Initialize/Update/Draw) jalan di thread
-            // render GLSurfaceView, BUKAN di UI thread. Dua statik ini harus
-            // menunjuk thread itu, karena:
+            // Tick (Initialize/Update/Draw) jalan di thread yang menjalankan
+            // iterasi worker MonoGame — dalam konfigurasi default
+            // (RenderOnUIThread=true) itu UI thread sendiri. Dua statik ini
+            // harus menunjuk thread itu, karena:
             // - TextureRef.Get() (tso.content/Model/TextureRef.cs:143)
             //   menjalankan pekerjaan GL langsung bila thread saat ini ==
             //   FSOEnvironment.GameThread, dan bila tidak, melemparnya lewat
@@ -95,9 +145,13 @@ namespace FSO.Android
                 + ", UI thread=" + (isUiThread ? "ya" : "tidak"));
 
             // Log tahap (perbaikan 5.2, diagnosis blackscreen): Initialize()
-            // jalan di Tick pertama (thread render, bukan UI thread) sebelum
-            // frame pertama — bila layar hitam, baris terakhir di log
-            // menunjukkan tahap mana yang belum selesai.
+            // jalan di Tick pertama, sebelum frame pertama — bila layar hitam,
+            // baris terakhir di log menunjukkan tahap mana yang belum selesai.
+            // Catatan 5.4: thread Tick adalah UI thread dalam konfigurasi
+            // default MonoGame Android (RenderOnUIThread=true) — baris log
+            // "UI thread=" di atas akan menjawab "ya", dan itu BENAR, bukan
+            // masalah. Yang penting statik thread game menunjuk thread Tick
+            // yang sebenarnya (diisi di atas dari Thread.CurrentThread).
             FileLogger.Log("RUN", "BlueberryGame.Initialize: sebelum base.Initialize()");
             base.Initialize();
             FileLogger.Log("RUN", "BlueberryGame.Initialize: base selesai, Target dibalik ke TS1");

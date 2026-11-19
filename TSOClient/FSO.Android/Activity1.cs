@@ -81,6 +81,9 @@ namespace FSO.Android
         // True bila satu sesi game sudah jalan di proses ini — dipakai OnDestroy
         // untuk mematikan proses (state statis FSO tidak bisa dibuat ulang).
         private bool _gameRan;
+        // Game yang dibuat sekali di OnCreate (perbaikan 5.4) — dipakai
+        // RunGame saat Play ditekan, dan heartbeat untuk melapor status loop.
+        private BlueberryGame _game;
         private System.Threading.Timer _heartbeatTimer;
         private System.Threading.Timer _survivalTimer;
 
@@ -98,7 +101,7 @@ namespace FSO.Android
             FileLogger.SetContext(ApplicationContext);
             var logDir = GetExternalFilesDir(null)?.AbsolutePath ?? FilesDir.AbsolutePath;
             FileLogger.Init(logDir);
-            FileLogger.Log("APP", "Blueberry FreeSO dimulai (versi 1.0-perbaikan-5.3)");
+            FileLogger.Log("APP", "Blueberry FreeSO dimulai (versi 1.0-perbaikan-5.4)");
             FileLogger.Log("APP", "HP: " + Build.Manufacturer + " " + Build.Model
                 + ", Android " + Build.VERSION.Release
                 + " (SDK " + (int)Build.VERSION.SdkInt + ")");
@@ -131,6 +134,130 @@ namespace FSO.Android
             // warisan PC) — loop digerakkan GLSurfaceView, Run() kembali
             // langsung. Lihat BlueberryGame.Run() dan RunGame() di bawah.
             ShowLauncher();
+
+            // Perbaikan 5.4: siapkan environment + buat game SEKARANG (di
+            // OnCreate), BUKAN saat Play ditekan. Alasannya (riset laporan §1):
+            // loop worker MonoGame hanya keluar dari status Exited lewat
+            // Resume(), dan Tick hanya jalan bila Platform.IsActive — dan
+            // keduanya hanya dibuka oleh OnResume() activity. Bila game baru
+            // dibuat saat Play (sesudah OnResume lewat), kedua gerbang itu
+            // tidak pernah terbuka dan Tick pertama tidak pernah jalan
+            // (log HP 5.3: heartbeat jalan, Initialize tidak pernah muncul).
+            // Dibuat di sini, OnResume yang datang sesudah OnCreate membuka
+            // kedua gerbang sebelum Play ditekan.
+            SetupGameEnvironment();
+            CreateGame();
+        }
+
+        /// <summary>
+        /// Perbaikan 5.4 — siapkan environment game yang TIDAK tergantung
+        /// folder game (dulu langkah 1, 2, 5, 6 di RunGame; dipindah ke sini
+        /// supaya game bisa dibuat di OnCreate).
+        ///
+        /// Urutan dipertahankan SAMA seperti dulu di RunGame: UserDir diisi
+        /// dulu (langkah 5) sebelum GlobalSettings.Default disentuh
+        /// (langkah 6), karena file config.ini disimpan di UserDir.
+        /// Konstruktor TSOGame membaca FSOEnvironment/GlobalSettings ini —
+        /// termasuk SoftwareDepth=true, yang membuat konstruktor MELEWATI
+        /// Graphics.ApplyChanges() (tanpa itu, konstruktor akan mencoba
+        /// membuat device grafis padahal belum ada surface GL). Yang
+        /// tergantung folder (TS1HybridPath, SetPath) tetap di RunGame
+        /// saat Play ditekan.
+        /// </summary>
+        private void SetupGameEnvironment()
+        {
+            // --- 1. DPI / zoom UI, pola FSODroid ---
+            // HP kecil: UI diperbesar supaya tombol tidak terlalu kecil.
+            var disp = Resources.DisplayMetrics;
+            var initSF = 1 + ((int)disp.DensityDpi / 200);
+            var dpiScaleFactor = initSF;
+            var width = Math.Max(disp.WidthPixels, disp.HeightPixels);
+            float uiZoomFactor = 1f;
+            while (width / dpiScaleFactor < 800 && dpiScaleFactor > 1)
+            {
+                dpiScaleFactor--;
+                uiZoomFactor = (initSF / dpiScaleFactor);
+            }
+
+            // --- 2. Pemuat gambar Android (ImageSharp), ganti System.Drawing di PC ---
+            ImageLoaderHelpers.BitmapFunction = AndroidImageLoader.BitmapReader;
+            ImageLoaderHelpers.SavePNGFunc = AndroidImageLoader.SavePNG;
+            FSO.Files.ImageLoader.UseSoftLoad = false;
+
+            // --- 5. FSOEnvironment, nilai-nilai dari FSODroid ---
+            // DirectX mati (Android = OpenGL), keyboard software nyala, GL versi 2.
+            var docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments);
+            FSOEnvironment.ContentDir = Path.Combine(docs, "Content/");
+            FSOEnvironment.GFXContentDir = "Content/OGL/"; // dibaca ContentManager dari aset APK
+            FSOEnvironment.UserDir = docs;
+            FSOEnvironment.Linux = true;
+            FSOEnvironment.DirectX = false;
+            FSOEnvironment.SoftwareKeyboard = true;
+            FSOEnvironment.SoftwareDepth = true;
+            FSOEnvironment.UseMRT = false;
+            FSOEnvironment.UIZoomFactor = uiZoomFactor;
+            FSOEnvironment.DPIScaleFactor = dpiScaleFactor;
+            FSOEnvironment.Enable3D = true;
+            FSOEnvironment.EnableNPOTMip = false;
+            FSOEnvironment.GLVer = 2;
+            FSOEnvironment.TexCompress = false;
+            FSOEnvironment.TexCompressSupport = false;
+
+            // Di bawah ini hanya agar pembacaan file relatif (mis. blueprint.dtd) jalan.
+            Directory.SetCurrentDirectory(docs);
+
+            GameFacade.DirectX = false;
+            World.DirectX = false;
+
+            // Pesan error dari dalam game (mis. konten gagal dimuat) dicatat ke logcat.
+            // Di PC pesan ini muncul sebagai MessageBox; di Android belum ada UI dialognya.
+            FSOProgram.ShowDialog = (text) => Log.Error(LogTag, "Game: " + text);
+
+            // --- 6. Pengaturan default, nilai-nilai dari FSODroid ---
+            // Catatan: GlobalSettings.Default baru boleh disentuh SETELAH UserDir diisi,
+            // karena file config.ini disimpan di UserDir.
+            GlobalSettings.Default.CityShadows = false;
+            var set = GlobalSettings.Default;
+            set.TargetRefreshRate = 60;
+            set.CurrentLang = "english";
+            set.Lighting = true;
+            set.SmoothZoom = true;
+            set.AntiAlias = 0;
+            set.LightingMode = 3;
+            set.AmbienceVolume = 10;
+            set.FXVolume = 10;
+            set.MusicVolume = 10;
+            set.VoxVolume = 10;
+            set.DirectionalLight3D = false;
+            FileLogger.Log("RUN", "pengaturan FSOEnvironment + GlobalSettings selesai (di OnCreate, perbaikan 5.4)");
+        }
+
+        /// <summary>
+        /// Perbaikan 5.4 — buat game di OnCreate (bukan di RunGame).
+        /// Konstruktor TSOGame membaca FSOEnvironment/GlobalSettings yang
+        /// sudah disiapkan SetupGameEnvironment() — urutan ini SAMA seperti
+        /// dulu di RunGame, hanya waktunya lebih awal. Game belum jalan di
+        /// sini (tidak ada SetContentView / Run) — ia baru jalan saat Play
+        /// ditekan. Gunanya: konstruktor platform MonoGame mendaftarkan
+        /// game ke event Resumed activity, sehingga OnResume yang datang
+        /// sesudah OnCreate membuka dua gerbang loop (IsActive + Resume
+        /// worker) sebelum Play — lihat laporan §1.
+        /// </summary>
+        private void CreateGame()
+        {
+            if (_game != null) return;
+            _game = new BlueberryGame();
+            // Sinyal keluar yang sesungguhnya (perbaikan 5.3): dengan loop
+            // async, game.Run() kembali LANGSUNG — bukan tanda game selesai.
+            // Game keluar nanti, saat user menekan Back di dalam game
+            // (TSOGame.OnExiting → Game.Exit() → event Exiting), lalu
+            // MonoGame menutup activity — barulah OnDestroy yang membereskan
+            // (MarkCleanExit + matikan proses). Event ini jalan di thread
+            // game; FileLogger thread-safe (satu lock), jadi aman dicatat
+            // dari sini.
+            _game.Exiting += (sender, args) =>
+                FileLogger.Log("RUN", "game keluar (Exiting) — loop async berhenti");
+            FileLogger.Log("RUN", "game dibuat (BlueberryGame) di OnCreate — OnResume sesudah ini membuka gerbang loop");
         }
 
         /// <summary>Auto-export log ke Download — best-effort, tidak pernah melempar.</summary>
@@ -160,6 +287,39 @@ namespace FSO.Android
             base.OnPause();
             CopyForegroundService.ProgressChanged -= OnCopyProgress;
             CopyForegroundService.CopyFinished -= OnCopyFinished;
+        }
+
+        /// <summary>
+        /// Perbaikan 5.4 — Back selalu bisa keluar sebelum Tick pertama.
+        ///
+        /// Kenapa harus di sini, bukan OnBackPressed: tombol Back DITELAN
+        /// game view (MonoGameAndroidGameView.OnKeyDown mengubahnya jadi
+        /// GamePad.Back, yang hanya dibaca di Update) — jadi
+        /// Activity.OnBackPressed tidak pernah dipanggil selagi game tampil.
+        /// DispatchKeyEvent dipanggil SEBELUM view mendapat event, jadi di
+        /// sinilah Back bisa ditangkap.
+        ///
+        /// Aturan: bila game sedang jalan tapi BELUM pernah Tick, Back tidak
+        /// akan pernah diproses game (tidak ada Update yang membaca
+        /// GamePad.Back) — jadi keluar paksa dengan Finish(); OnDestroy lalu
+        /// mematikan proses dan user kembali ke launcher segar saat buka
+        /// ulang. Bila game SUDAH pernah Tick, Back diteruskan ke game
+        /// (base.DispatchKeyEvent → view → GamePad.Back / Keys.Back) dan
+        /// game yang menangani.
+        /// </summary>
+        public override bool DispatchKeyEvent(KeyEvent e)
+        {
+            if (e != null && BackExitPolicy.ShouldForceExit(
+                e.KeyCode == Keycode.Back,
+                e.Action == KeyEventActions.Down,
+                _gameStarted,
+                BlueberryGame.HasTicked))
+            {
+                FileLogger.Log("APP", "Back ditekan sebelum Tick pertama — keluar paksa (Finish) supaya tidak terjebak di layar hitam");
+                Finish();
+                return true;
+            }
+            return base.DispatchKeyEvent(e);
         }
 
         protected override void OnDestroy()
@@ -894,7 +1054,22 @@ namespace FSO.Android
                     string progress;
                     try { progress = FSO.Content.Content.LoadProgress.ToString(); }
                     catch (Exception) { progress = "?"; }
-                    FileLogger.Log("RUN", "heartbeat " + elapsed + " detik, LoadProgress=" + progress);
+                    // Perbaikan 5.4 — laporkan juga status loop, supaya dari
+                    // log kelihatan apakah Tick jalan dan view terpasang.
+                    string tick = BlueberryGame.HasTicked ? "Tick=ya" : "Tick=belum";
+                    string active;
+                    string viewInfo;
+                    try
+                    {
+                        active = "IsActive=" + (_game == null ? "?" : (_game.IsActive ? "ya" : "tidak"));
+                        var v = _game?.Services.GetService(typeof(View)) as View;
+                        viewInfo = v == null ? "view=?"
+                            : "view terpasang=" + (v.IsAttachedToWindow ? "ya" : "tidak")
+                            + " " + v.Width + "x" + v.Height;
+                    }
+                    catch (Exception) { active = "IsActive=?"; viewInfo = "view=?"; }
+                    FileLogger.Log("RUN", "heartbeat " + elapsed + " detik, LoadProgress=" + progress
+                        + ", " + tick + ", " + active + ", " + viewInfo);
                 }
                 catch (Exception) { }
             }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
@@ -913,23 +1088,11 @@ namespace FSO.Android
 
             try
             {
-                // --- 1. DPI / zoom UI, pola FSODroid ---
-                // HP kecil: UI diperbesar supaya tombol tidak terlalu kecil.
-                var disp = Resources.DisplayMetrics;
-                var initSF = 1 + ((int)disp.DensityDpi / 200);
-                var dpiScaleFactor = initSF;
-                var width = Math.Max(disp.WidthPixels, disp.HeightPixels);
-                float uiZoomFactor = 1f;
-                while (width / dpiScaleFactor < 800 && dpiScaleFactor > 1)
-                {
-                    dpiScaleFactor--;
-                    uiZoomFactor = (initSF / dpiScaleFactor);
-                }
-
-                // --- 2. Pemuat gambar Android (ImageSharp), ganti System.Drawing di PC ---
-                ImageLoaderHelpers.BitmapFunction = AndroidImageLoader.BitmapReader;
-                ImageLoaderHelpers.SavePNGFunc = AndroidImageLoader.SavePNG;
-                FSO.Files.ImageLoader.UseSoftLoad = false;
+                // Langkah 1, 2, 5, 6 (DPI/zoom, ImageSharp, FSOEnvironment,
+                // GlobalSettings) sudah dikerjakan di OnCreate
+                // (SetupGameEnvironment, perbaikan 5.4) — supaya game bisa
+                // dibuat di OnCreate dan OnResume membuka gerbang loop.
+                // Di sini tinggal yang tergantung folder game.
 
                 // --- 3. Salin konten game (aset kecil) ke storage, sekali saja ---
                 // FSOEnvironment.ContentDir dibaca lewat File IO biasa (bukan lewat ContentManager),
@@ -953,76 +1116,43 @@ namespace FSO.Android
                 GlobalSettings.Default.TS1HybridPath = gameFolder;
                 FSO.Client.GameContent.ContentStrings.TS1 = true;
 
-                // --- 5. FSOEnvironment, nilai-nilai dari FSODroid ---
-                // DirectX mati (Android = OpenGL), keyboard software nyala, GL versi 2.
-                FSOEnvironment.ContentDir = Path.Combine(docs, "Content/");
-                FSOEnvironment.GFXContentDir = "Content/OGL/"; // dibaca ContentManager dari aset APK
-                FSOEnvironment.UserDir = docs;
-                FSOEnvironment.Linux = true;
-                FSOEnvironment.DirectX = false;
-                FSOEnvironment.SoftwareKeyboard = true;
-                FSOEnvironment.SoftwareDepth = true;
-                FSOEnvironment.UseMRT = false;
-                FSOEnvironment.UIZoomFactor = uiZoomFactor;
-                FSOEnvironment.DPIScaleFactor = dpiScaleFactor;
-                FSOEnvironment.Enable3D = true;
-                FSOEnvironment.EnableNPOTMip = false;
-                FSOEnvironment.GLVer = 2;
-                FSOEnvironment.TexCompress = false;
-                FSOEnvironment.TexCompressSupport = false;
-
-                // Di bawah ini hanya agar pembacaan file relatif (mis. blueprint.dtd) jalan.
-                Directory.SetCurrentDirectory(docs);
-
-                // FSOEnvironment.GameThread TIDAK diisi di sini lagi (perbaikan
-                // 5.3): RunGame jalan di UI thread, sedangkan tick game async
-                // jalan di thread render GLSurfaceView. Statik itu diisi di
-                // BlueberryGame.Initialize() — di thread tick yang sebenarnya,
-                // sebelum base.Initialize(). Lihat BlueberryGame.cs.
-
-                // Pesan error dari dalam game (mis. konten gagal dimuat) dicatat ke logcat.
-                // Di PC pesan ini muncul sebagai MessageBox; di Android belum ada UI dialognya.
-                FSOProgram.ShowDialog = (text) => Log.Error(LogTag, "Game: " + text);
-
-                // --- 6. Pengaturan default, nilai-nilai dari FSODroid ---
-                // Catatan: GlobalSettings.Default baru boleh disentuh SETELAH UserDir diisi,
-                // karena file config.ini disimpan di UserDir.
-                GlobalSettings.Default.CityShadows = false;
-                var set = GlobalSettings.Default;
-                set.TargetRefreshRate = 60;
-                set.CurrentLang = "english";
-                set.Lighting = true;
-                set.SmoothZoom = true;
-                set.AntiAlias = 0;
-                set.LightingMode = 3;
-                set.AmbienceVolume = 10;
-                set.FXVolume = 10;
-                set.MusicVolume = 10;
-                set.VoxVolume = 10;
-                set.DirectionalLight3D = false;
-                FileLogger.Log("RUN", "pengaturan FSOEnvironment + GlobalSettings selesai");
-
                 // --- 7. Jalankan game (pola GameStartProxy, sama seperti PC) ---
                 var start = new GameStartProxy();
                 start.SetPath(gameFolder);
                 FileLogger.Log("RUN", "SetPath selesai: " + gameFolder);
 
-                FileLogger.Log("RUN", "game dibuat (BlueberryGame)");
-                BlueberryGame game = new BlueberryGame();
-                GameFacade.DirectX = false;
-                World.DirectX = false;
-                // Sinyal keluar yang sesungguhnya (perbaikan 5.3): dengan loop
-                // async, game.Run() kembali LANGSUNG — bukan tanda game selesai.
-                // Game keluar nanti, saat user menekan Back di dalam game
-                // (TSOGame.OnExiting → Game.Exit() → event Exiting), lalu
-                // MonoGame menutup activity — barulah OnDestroy yang membereskan
-                // (MarkCleanExit + matikan proses). Event ini jalan di thread
-                // game; FileLogger thread-safe (satu lock), jadi aman dicatat
-                // dari sini.
-                game.Exiting += (sender, args) =>
-                    FileLogger.Log("RUN", "game keluar (Exiting) — loop async berhenti");
-                SetContentView((View)game.Services.GetService(typeof(View)));
+                // Game dibuat di OnCreate (perbaikan 5.4), bukan di sini —
+                // supaya OnResume sudah membuka gerbang loop sebelum Play.
+                // Fallback: bila entah bagaimana belum dibuat, buat di sini
+                // (kasus ini tidak diharapkan; gerbang loop mungkin belum
+                // terbuka — lihat laporan §1).
+                if (_game == null)
+                {
+                    FileLogger.Log("RUN", "PERINGATAN: game belum dibuat di OnCreate — dibuat di RunGame sebagai fallback");
+                    CreateGame();
+                }
+                var game = _game;
+                var viewService = game.Services.GetService(typeof(View));
+                SetContentView((View)viewService);
                 FileLogger.Log("RUN", "SetContentView selesai");
+                // Perbaikan 5.4 — sinyal Resume manual (sabuk + pengaman):
+                // OnResume() activity seharusnya sudah memanggil
+                // GameView.Resume() dan membuka gerbang loop; panggilan ini
+                // memastikan status worker MonoGame = Resuming SEBELUM Run()
+                // memulai thread worker. Tanpa sinyal ini, iterasi pertama
+                // worker melihat status Exited dan mematikan dirinya sendiri
+                // (laporan §1). Tidak berbahaya bila OnResume sudah
+                // melakukannya (Resume() hanya mengeset status yang sama).
+                var gameView = viewService as MonoGameAndroidGameView;
+                if (gameView == null)
+                {
+                    FileLogger.Log("RUN", "PERINGATAN: game view bukan MonoGameAndroidGameView — Resume() manual dilewati");
+                }
+                else
+                {
+                    gameView.Resume();
+                    FileLogger.Log("RUN", "game view Resume() dipanggil (sinyal resume untuk worker loop MonoGame)");
+                }
                 FileLogger.Log("RUN", "game.Run() dipanggil (Asynchronous — kembali langsung, loop jalan sendiri)");
                 game.Run();
                 FileLogger.Log("RUN", "game.Run() kembali — loop async berjalan, activity tetap di tampilan game");

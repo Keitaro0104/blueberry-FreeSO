@@ -5,12 +5,20 @@ using System.IO;
 namespace FSO.Android
 {
     /// <summary>
-    /// Mencari folder game di storage Android.
+    /// Mencari folder game The Sims 1 (bukan The Sims Online) di storage Android.
     /// Pengganti WindowsLocator (Registry + kernel32.dll) dan LinuxLocator untuk Android.
-    /// Folder game mengikuti pola FSODroid lama: {storage aplikasi}/The Sims Online/TSOClient/
-    /// dengan file penanda tuning.dat — sama seperti yang dicek FSOProgram di jalur PC.
-    /// Catatan: ini masih layout TSO (The Sims Online). Layout file The Sims 1 (TS1Hybrid)
-    /// diputuskan di Langkah 5 (file picker).
+    ///
+    /// Urutan pencarian:
+    /// 1. Folder yang tersimpan di SharedPreferences (hasil pemilih folder Langkah 5).
+    /// 2. Folder `{GetExternalFilesDir}/The Sims` — tempat file game disalin lewat
+    ///    USB/ADB dari PC teman (pola davius: adb push ke
+    ///    /sdcard/Android/data/com.keitaro0104.blueberryfreeso/files/The Sims/).
+    ///
+    /// Folder yang dicari adalah ROOT instalasi The Sims 1 (Complete Collection /
+    /// Legacy Collection) — folder yang di dalamnya ada GameData/ — BUKAN folder
+    /// TSOClient + tuning.dat (itu layout The Sims Online, hanya dipakai mode TSO).
+    /// Validasi memakai GameFolderValidator (penanda GameData/Behavior.iff dst.,
+    /// mengikuti Simitone: Simitone.Windows/GameLocator/*Locator.cs).
     /// </summary>
     public class AndroidLocator : ILocator
     {
@@ -21,26 +29,38 @@ namespace FSO.Android
             _context = context;
         }
 
-        /// <summary>
-        /// Folder root game di storage aplikasi. Memakai GetExternalFilesDir (folder khusus
-        /// aplikasi, tidak butuh izin storage) dengan fallback ke FilesDir internal.
-        /// </summary>
+        /// <summary>Folder root game di storage khusus aplikasi (tidak butuh izin storage).</summary>
         public static string GameRoot(Context context)
         {
-            var ext = context.GetExternalFilesDir(null);
-            if (ext != null) return Path.Combine(ext.AbsolutePath, "The Sims Online");
-            return Path.Combine(context.FilesDir.AbsolutePath, "The Sims Online");
+            return GameFolderManager.AppGameRoot(context);
         }
 
         /// <summary>
-        /// Mengembalikan folder TSOClient bila tuning.dat ditemukan di sana,
-        /// atau null bila file game belum ada di HP (kasus normal sebelum Langkah 5).
+        /// Mengembalikan folder instalasi The Sims 1 bila sudah ada dan valid,
+        /// atau null bila file game belum ada di HP.
+        /// </summary>
+        public string FindTheSims1()
+        {
+            var saved = GameFolderManager.SavedGameFolder(_context);
+            if (saved != null) return saved;
+
+            var direct = GameRoot(_context);
+            if (GameFolderValidator.Validate(direct).IsValid)
+            {
+                GameFolderManager.SaveGameFolder(_context, direct);
+                return direct;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Wajib ada karena interface ILocator (FSO.Client) hanya mendeklarasikan ini.
+        /// Di Android, "game" yang dicari selalu The Sims 1 — jadi didelegasikan
+        /// ke FindTheSims1().
         /// </summary>
         public string FindTheSimsOnline()
         {
-            var clientDir = Path.Combine(GameRoot(_context), "TSOClient");
-            if (File.Exists(Path.Combine(clientDir, "tuning.dat"))) return clientDir;
-            return null;
+            return FindTheSims1();
         }
     }
 }

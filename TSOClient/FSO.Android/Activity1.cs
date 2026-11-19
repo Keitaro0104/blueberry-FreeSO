@@ -1,8 +1,10 @@
 using Android.App;
+using Android.Content;
 using Android.Content.PM;
 using Android.OS;
 using Android.Util;
 using Android.Views;
+using Android.Widget;
 using FSO.Client;
 using FSO.Common;
 using FSO.Files;
@@ -11,16 +13,26 @@ using Microsoft.Xna.Framework;
 using System;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace FSO.Android
 {
     /// <summary>
     /// Activity utama game. Port dari FSODroid lama (TSOClient/FSODroid/FSOActivity.cs,
     /// method RunGame) ke .NET for Android modern — urutan logikanya sama, API-nya baru.
-    /// Alurnya: hitung DPI/zoom -&gt; isi pemuat gambar (ImageSharp) -&gt; cari file game
-    /// (AndroidLocator) -&gt; isi FSOEnvironment -&gt; GameStartProxy -&gt; TSOGame -&gt; Run().
-    /// TTS sengaja TIDAK diaktifkan (ITTSContext.Provider dibiarkan null, jadi panel chat
-    /// tidak mencoba bicara) dan DirectX dimatikan (Android hanya bisa OpenGL).
+    ///
+    /// Alur startup (Langkah 5):
+    /// 1. Hitung DPI/zoom, isi pemuat gambar (ImageSharp).
+    /// 2. Cari folder game The Sims 1: folder tersimpan (pemilih folder) atau folder
+    ///    `{GetExternalFilesDir}/The Sims` (hasil adb push dari PC teman).
+    /// 3. Bila belum ada, tampilkan layar setup dengan tombol "Pilih Folder Game"
+    ///    (Storage Access Framework). Folder yang dipilih divalidasi
+    ///    (GameData/Behavior.iff dst.) lalu disalin ke storage khusus aplikasi —
+    ///    engine butuh jalur file sungguhan, sedangkan SAF hanya memberi URI.
+    /// 4. Jalankan game dalam mode TS1 murni (BlueberryGame, seperti Simitone):
+    ///    `TS1HybridEnable = true`, `TS1HybridPath` = folder game, string UI dari
+    ///    GameData/UIText.iff. TTS sengaja TIDAK diaktifkan dan DirectX dimatikan
+    ///    (Android hanya bisa OpenGL).
     /// </summary>
     [Activity(
         Label = "@string/app_name",
@@ -38,6 +50,10 @@ namespace FSO.Android
     public class Activity1 : AndroidGameActivity
     {
         private const string LogTag = "BlueberryFreeSO";
+        private const int RequestPickGameFolder = 1001;
+
+        private Button _pickButton;
+        private TextView _setupStatus;
 
         protected override void OnCreate(Bundle bundle)
         {
@@ -50,10 +66,162 @@ namespace FSO.Android
                 Log.Error(LogTag, "FATAL: " + e.ExceptionObject.ToString());
             };
 
-            RunGame();
+            // Folder game sudah ada (tersimpan / hasil adb push)? Langsung main.
+            var folder = new AndroidLocator(this).FindTheSims1();
+            if (folder != null)
+            {
+                RunGame(folder);
+            }
+            else
+            {
+                ShowSetupScreen();
+            }
         }
 
-        private void RunGame()
+        /// <summary>
+        /// Layar setup: menjelaskan bahwa aplikasi butuh file game asli,
+        /// dengan tombol untuk memilih folder game. Dibangun lewat kode
+        /// (tanpa file layout XML) supaya tetap satu file.
+        /// </summary>
+        private void ShowSetupScreen()
+        {
+            var density = Resources.DisplayMetrics.Density;
+            int pad = (int)(24 * density);
+
+            var layout = new LinearLayout(this)
+            {
+                Orientation = Orientation.Vertical,
+            };
+            layout.SetPadding(pad, pad, pad, pad);
+            layout.SetGravity(GravityFlags.CenterHorizontal);
+
+            var title = new TextView(this);
+            title.SetTextSize(ComplexUnitType.Sp, 24);
+            title.Text = "Blueberry FreeSO";
+            layout.AddView(title);
+
+            var info = new TextView(this);
+            info.SetTextSize(ComplexUnitType.Sp, 16);
+            info.SetPadding(0, pad, 0, pad);
+            info.Text = "Aplikasi ini butuh file game asli The Sims 1 "
+                + "(Complete Collection / Legacy Collection) untuk bisa jalan.\n\n"
+                + "Cara 1: salin folder \"The Sims\" dari PC teman ke HP lewat USB/ADB, "
+                + "ke folder:\n" + GameFolderManager.AppGameRoot(this) + "\n"
+                + "lalu buka lagi aplikasi ini.\n\n"
+                + "Cara 2: salin folder \"The Sims\" ke HP (mis. ke Download), "
+                + "lalu pilih folder itu di bawah ini. Aplikasi akan menyalinnya "
+                + "ke storage aplikasi (butuh ruang kosong sekitar 3 GB).";
+            layout.AddView(info);
+
+            _pickButton = new Button(this);
+            _pickButton.Text = "Pilih Folder Game";
+            _pickButton.Click += (sender, args) => PickFolder();
+            layout.AddView(_pickButton);
+
+            _setupStatus = new TextView(this);
+            _setupStatus.SetTextSize(ComplexUnitType.Sp, 14);
+            _setupStatus.SetPadding(0, pad / 2, 0, 0);
+            layout.AddView(_setupStatus);
+
+            SetContentView(layout);
+        }
+
+        /// <summary>Buka pemilih folder sistem (Storage Access Framework).</summary>
+        private void PickFolder()
+        {
+            var intent = new Intent(Intent.ActionOpenDocumentTree);
+            intent.AddFlags(ActivityFlags.GrantReadUriPermission
+                | ActivityFlags.GrantPersistableUriPermission
+                | ActivityFlags.GrantPrefixUriPermission);
+            StartActivityForResult(intent, RequestPickGameFolder);
+        }
+
+        protected override void OnActivityResult(int requestCode, Result resultCode, Intent data)
+        {
+            base.OnActivityResult(requestCode, resultCode, data);
+            if (requestCode != RequestPickGameFolder) return;
+
+            if (resultCode != Result.Ok || data?.Data == null)
+            {
+                // User membatalkan pemilih folder: beri pesan yang jelas, lalu tutup
+                // (bukan crash). Buka lagi aplikasi untuk mencoba lagi.
+                var builder = new AlertDialog.Builder(this);
+                builder.SetTitle("Pemilihan dibatalkan");
+                builder.SetMessage("Blueberry FreeSO membutuhkan folder game The Sims 1 asli "
+                    + "untuk bisa jalan. Aplikasi akan ditutup — buka lagi dan pilih "
+                    + "folder game untuk mencoba lagi.");
+                builder.SetPositiveButton("OK", (sender, args) => Finish());
+                builder.SetCancelable(false);
+                builder.Show();
+                return;
+            }
+
+            var treeUri = data.Data;
+            try
+            {
+                // Simpan izin baca folder ini supaya URI-nya bisa dipakai lagi nanti.
+                ContentResolver.TakePersistableUriPermission(
+                    treeUri, ActivityFlags.GrantReadUriPermission);
+            }
+            catch (Exception e)
+            {
+                Log.Warn(LogTag, "TakePersistableUriPermission gagal: " + e.Message);
+            }
+            StartCopyFromTree(treeUri);
+        }
+
+        /// <summary>
+        /// Validasi folder yang dipilih, lalu salin isinya ke storage aplikasi
+        /// di thread latar (supaya layar tidak beku), dengan progress.
+        /// </summary>
+        private async void StartCopyFromTree(global::Android.Net.Uri treeUri)
+        {
+            _pickButton.Enabled = false;
+            _setupStatus.Text = "Memeriksa folder game...";
+            try
+            {
+                var validation = await Task.Run(
+                    () => GameFolderManager.ValidateTree(this, treeUri));
+                if (!validation.IsValid)
+                {
+                    _setupStatus.Text = "Folder tidak valid.\n\n" + validation.UserMessage;
+                    _pickButton.Enabled = true;
+                    return;
+                }
+
+                var dest = GameFolderManager.AppGameRoot(this);
+                _setupStatus.Text = "Menyalin file game... 0%";
+                var progress = new Progress<GameFolderCopyProgress>(p =>
+                {
+                        _setupStatus.Text = "Menyalin file game... " + p.Percent + "%"
+                        + " (" + p.CopiedFiles + "/" + p.TotalFiles + " file)\n" + p.CurrentFile;
+                });
+                await GameFolderManager.CopyTreeAsync(
+                    this, treeUri, dest, progress, CancellationToken.None);
+
+                var check = GameFolderValidator.Validate(dest);
+                if (!check.IsValid)
+                {
+                    _setupStatus.Text = "Salinan tidak lengkap, file ini hilang:\n- "
+                        + string.Join("\n- ", check.MissingFiles)
+                        + "\n\nCoba pilih folder game lagi.";
+                    _pickButton.Enabled = true;
+                    return;
+                }
+
+                GameFolderManager.SaveGameFolder(this, dest, treeUri.ToString());
+                RunGame(dest);
+            }
+            catch (Exception e)
+            {
+                Log.Error(LogTag, "Setup folder game gagal: " + e);
+                _setupStatus.Text = "Gagal menyalin folder game:\n" + e.Message
+                    + "\n\nCoba lagi.";
+                _pickButton.Enabled = true;
+            }
+        }
+
+        private void RunGame(string gameFolder)
         {
             // --- 1. DPI / zoom UI, pola FSODroid ---
             // HP kecil: UI diperbesar supaya tombol tidak terlalu kecil.
@@ -80,19 +248,17 @@ namespace FSO.Android
             var docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments);
             CopyContentOnce(docs);
 
-            // --- 4. Cari file game asli (pola FSOProgram: locator + tuning.dat) ---
-            var locator = new AndroidLocator(this);
-            var gamePath = locator.FindTheSimsOnline();
-            if (gamePath == null)
-            {
-                var message = "File game belum ditemukan di HP ini.\n\n"
-                    + "Blueberry FreeSO butuh file game asli (The Sims Online / The Sims 1) "
-                    + "di folder:\n" + AndroidLocator.GameRoot(this) + "/TSOClient/\n\n"
-                    + "Penyalinan file game dari perangkatmu akan ditambahkan di Langkah 5.";
-                Log.Warn(LogTag, "Game files not found at " + AndroidLocator.GameRoot(this));
-                ShowFatalMessage("File game belum ditemukan", message);
-                return;
-            }
+            // --- 4. Mode TS1 murni (Simone) + folder game ---
+            // Simitone: GlobalSettings TS1HybridEnable = true, TS1HybridPath = folder
+            // instalasi TS1, dan ContentStrings.TS1 = true supaya string UI dibaca
+            // dari GameData/UIText.iff (bukan dari data TSO). StartupPath juga
+            // diisi folder TS1 (dipakai Content.InitBasic sebagai BasePath — dalam
+            // mode TS1 murni pemindaian BasePath sebagai file TSO dilewati).
+            // BlueberryGame membalik Content.Target ke FSOEngineMode.TS1 setelah
+            // TSOGame.Initialize() (yang hanya bisa menghasilkan TS1Hybrid/TSO).
+            GlobalSettings.Default.TS1HybridEnable = true;
+            GlobalSettings.Default.TS1HybridPath = gameFolder;
+            FSO.Client.GameContent.ContentStrings.TS1 = true;
 
             // --- 5. FSOEnvironment, nilai-nilai dari FSODroid ---
             // DirectX mati (Android = OpenGL), keyboard software nyala, GL versi 2.
@@ -140,9 +306,9 @@ namespace FSO.Android
 
             // --- 7. Jalankan game (pola GameStartProxy, sama seperti PC) ---
             var start = new GameStartProxy();
-            start.SetPath(gamePath);
+            start.SetPath(gameFolder);
 
-            TSOGame game = new TSOGame();
+            BlueberryGame game = new BlueberryGame();
             GameFacade.DirectX = false;
             World.DirectX = false;
             SetContentView((View)game.Services.GetService(typeof(View)));
@@ -152,8 +318,9 @@ namespace FSO.Android
         /// <summary>
         /// Menyalin file konten kecil (efek, font, tekstur — dari TSOClient/tso.content/Content,
         /// dipaketkan sebagai aset APK) ke {docs}/Content/, sekali saja. Dicegah salin ulang
-        /// dengan file penanda. Konten besar FSO.Content.TSO (Objects/, ~288 MB) BELUM
-        /// dipaketkan — itu pekerjaan Langkah 5.
+        /// dengan file penanda. Konten besar FSO.Content.TSO (Objects/, ~288 MB) TIDAK
+        /// dipaketkan — dalam mode TS1, objek dimuat dari instalasi TS1 sendiri
+        /// (TS1ObjectProvider), bukan dari Objects/ TSO.
         /// </summary>
         private void CopyContentOnce(string docs)
         {
@@ -209,7 +376,7 @@ namespace FSO.Android
 
         /// <summary>
         /// Tampilkan pesan fatal sebagai dialog Android lalu tutup activity.
-        /// Dipakai saat game tidak bisa jalan sama sekali (mis. file game belum ada).
+        /// Dipakai saat game tidak bisa jalan sama sekali.
         /// </summary>
         private void ShowFatalMessage(string title, string message)
         {

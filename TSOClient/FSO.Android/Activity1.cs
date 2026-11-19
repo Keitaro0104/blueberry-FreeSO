@@ -2,6 +2,7 @@ using Android.App;
 using Android.Content;
 using Android.Content.PM;
 using Android.OS;
+using Android.Runtime;
 using Android.Util;
 using Android.Views;
 using Android.Widget;
@@ -21,27 +22,33 @@ namespace FSO.Android
     /// Activity utama game. Port dari FSODroid lama (TSOClient/FSODroid/FSOActivity.cs,
     /// method RunGame) ke .NET for Android modern — urutan logikanya sama, API-nya baru.
     ///
-    /// Alur startup (Langkah 5):
+    /// Alur startup (Langkah 5 + perbaikan 5.1):
     /// 1. Hitung DPI/zoom, isi pemuat gambar (ImageSharp).
-    /// 2. Cari folder game The Sims 1: folder tersimpan (pemilih folder) atau folder
-    ///    `{GetExternalFilesDir}/The Sims` (hasil adb push dari PC teman).
-    /// 3. Bila belum ada, tampilkan layar setup dengan tombol "Pilih Folder Game"
-    ///    (Storage Access Framework). Folder yang dipilih divalidasi
-    ///    (GameData/Behavior.iff dst.) lalu disalin ke storage khusus aplikasi —
-    ///    engine butuh jalur file sungguhan, sedangkan SAF hanya memberi URI.
-    /// 4. Jalankan game dalam mode TS1 murni (BlueberryGame, seperti Simitone):
-    ///    `TS1HybridEnable = true`, `TS1HybridPath` = folder game, string UI dari
-    ///    GameData/UIText.iff. TTS sengaja TIDAK diaktifkan dan DirectX dimatikan
-    ///    (Android hanya bisa OpenGL).
+    /// 2. Cari folder game The Sims 1: folder tersimpan (pemilih folder / mode
+    ///    langsung) atau folder `{GetExternalFilesDir}/The Sims` (hasil adb push).
+    /// 3. Bila belum ada, tampilkan layar setup: pilih folder game (SAF), lalu
+    ///    pilih cara memakai folder itu:
+    ///      a. "Pakai langsung" — tanpa menyalin, bila folder ada di jalur nyata
+    ///         yang bisa dibaca engine (mis. /storage/emulated/0/IDM/Download/
+    ///         The Sims) dan izin "akses semua file" diberikan;
+    ///      b. "Salin ke storage aplikasi" (bawaan);
+    ///      c. "Salin ke Download/BlueberryFreeSO";
+    ///      d. "Salin ke folder lain..." (pilih folder tujuan).
+    ///    Penyalinan jalan di foreground service (tetap jalan walau aplikasi
+    ///    diminimalkan) dengan notifikasi progres + tombol Batal/Lanjutkan.
+    /// 4. Jalankan game dalam mode TS1 murni (BlueberryGame, seperti Simitone).
+    /// 5. Semua tahap dicatat ke file log .txt (tombol "Lihat Log" di layar
+    ///    setup) — bila penyalinan macet lagi, log menunjukkan tahap terakhir.
     /// </summary>
     [Activity(
         Label = "@string/app_name",
         MainLauncher = true,
-        // Icon sengaja TIDAK dipasang di sini: file Resources/Drawable/Icon.png
-        // adalah biner dan tidak ikut ter-push lewat GitHub connector saat PR #3
-        // (connector hanya bisa file teks), jadi drawable/icon tidak ada di repo.
-        // Bila Icon.png sudah diunggah lewat web UI, kembalikan baris ini:
-        // Icon = "@drawable/icon",
+        // Ikon blueberry (Resources/Drawable/Icon.png, dari gambar user,
+        // dikonversi JPG 350x350 -> PNG 512x512 pada perbaikan Langkah 5.1).
+        // CATATAN: file PNG ini biner — tidak bisa di-push lewat GitHub connector.
+        // Bila PR nanti tidak berisi Icon.png, user harus mengunggahnya lewat
+        // web UI GitHub sebelum merge (pola yang sama seperti Langkah 3).
+        Icon = "@drawable/icon",
         AlwaysRetainTaskState = true,
         LaunchMode = LaunchMode.SingleInstance,
         ScreenOrientation = ScreenOrientation.SensorLandscape,
@@ -51,9 +58,21 @@ namespace FSO.Android
     {
         private const string LogTag = "BlueberryFreeSO";
         private const int RequestPickGameFolder = 1001;
+        private const int RequestPickDestFolder = 1002;
+        private const int RequestSaveLog = 1003;
+        private const int RequestPostNotifications = 2002;
 
         private Button _pickButton;
+        private Button _resumeButton;
+        private Button _cancelButton;
+        private Button _logButton;
         private TextView _setupStatus;
+        private bool _setupShown;
+        private bool _gameStarted;
+
+        // Folder sumber yang sedang menunggu pilihan tujuan (dipakai alur "folder lain").
+        private global::Android.Net.Uri _pendingSourceUri;
+        private string _pendingSourceRealPath;
 
         protected override void OnCreate(Bundle bundle)
         {
@@ -61,20 +80,119 @@ namespace FSO.Android
             Window.ClearFlags(WindowManagerFlags.ForceNotFullscreen);
             Window.AddFlags(WindowManagerFlags.Fullscreen);
 
+            // --- Log .txt: pasang dulu, sebelum apa pun ---
+            var logDir = GetExternalFilesDir(null)?.AbsolutePath ?? FilesDir.AbsolutePath;
+            FileLogger.Init(logDir);
+            FileLogger.Log("APP", "Blueberry FreeSO dimulai (versi 1.0-perbaikan-5.1)");
+
+            // Crash (uncaught exception) ditulis ke file .txt sebelum aplikasi menutup,
+            // supaya penyebab force close bisa dibaca tanpa logcat.
             AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
             {
                 Log.Error(LogTag, "FATAL: " + e.ExceptionObject.ToString());
+                FileLogger.LogCrash("AppDomain", e.ExceptionObject);
+            };
+            AndroidEnvironment.UnhandledExceptionRaiser += (sender, e) =>
+            {
+                Log.Error(LogTag, "FATAL (Android): " + e.Exception);
+                FileLogger.LogCrash("Android", e.Exception);
+            };
+            TaskScheduler.UnobservedTaskException += (sender, e) =>
+            {
+                Log.Error(LogTag, "FATAL (Task): " + e.Exception);
+                FileLogger.LogCrash("Task", e.Exception);
             };
 
             // Folder game sudah ada (tersimpan / hasil adb push)? Langsung main.
             var folder = new AndroidLocator(this).FindTheSims1();
             if (folder != null)
             {
+                FileLogger.Log("APP", "Folder game ditemukan: " + folder);
                 RunGame(folder);
             }
             else
             {
+                FileLogger.Log("APP", "Folder game belum ada — tampilkan layar setup");
                 ShowSetupScreen();
+            }
+        }
+
+        protected override void OnResume()
+        {
+            base.OnResume();
+            if (!_setupShown || _gameStarted) return;
+            CopyForegroundService.ProgressChanged += OnCopyProgress;
+            CopyForegroundService.CopyFinished += OnCopyFinished;
+            // Salinan selesai selagi aplikasi diminimalkan? Langsung jalankan game.
+            var state = CopyStateStore.Load(this);
+            if (state.Status == CopyJobStatus.Complete && !string.IsNullOrEmpty(state.DestPath))
+            {
+                var check = GameFolderValidator.Validate(state.DestPath);
+                if (check.IsValid)
+                {
+                    FileLogger.Log("APP", "Salinan selesai di latar belakang — jalankan game: " + state.DestPath);
+                    RunGame(state.DestPath);
+                    return;
+                }
+            }
+            RefreshResumeButton();
+        }
+
+        protected override void OnPause()
+        {
+            base.OnPause();
+            CopyForegroundService.ProgressChanged -= OnCopyProgress;
+            CopyForegroundService.CopyFinished -= OnCopyFinished;
+        }
+
+        private void OnCopyProgress(GameFolderCopyProgress p)
+        {
+            RunOnUiThread(() =>
+            {
+                if (_setupStatus == null) return;
+                _setupStatus.Text = p.StatusText;
+                if (_cancelButton != null)
+                    _cancelButton.Visibility = p.Phase == CopyPhase.Copying || p.Phase == CopyPhase.Counting
+                        ? ViewStates.Visible : ViewStates.Gone;
+            });
+        }
+
+        private void OnCopyFinished(CopyState state)
+        {
+            RunOnUiThread(() =>
+            {
+                if (_gameStarted) return;
+                if (state.Status == CopyJobStatus.Complete && !string.IsNullOrEmpty(state.DestPath))
+                {
+                    RunGame(state.DestPath);
+                    return;
+                }
+                if (_setupStatus != null)
+                {
+                    _setupStatus.Text = state.Status == CopyJobStatus.Cancelled
+                        ? "Penyalinan dibatalkan pada " + state.CopiedFiles + "/" + state.TotalFiles
+                            + " file.\nFile yang sudah tersalin tidak perlu disalin ulang — "
+                            + "ketuk \"Lanjutkan Penyalinan\"."
+                        : "Penyalinan gagal:\n" + state.LastError
+                            + "\n\nLihat log (.txt) untuk detail, lalu ketuk "
+                            + "\"Lanjutkan Penyalinan\" untuk mencoba lagi.";
+                }
+                if (_pickButton != null) _pickButton.Enabled = true;
+                if (_cancelButton != null) _cancelButton.Visibility = ViewStates.Gone;
+                RefreshResumeButton();
+            });
+        }
+
+        private void RefreshResumeButton()
+        {
+            if (_resumeButton == null) return;
+            var state = CopyStateStore.Load(this);
+            _resumeButton.Visibility = state.CanResume ? ViewStates.Visible : ViewStates.Gone;
+            if (state.CanResume)
+            {
+                _resumeButton.Text = "Lanjutkan Penyalinan (" + state.CopiedFiles + "/"
+                    + state.TotalFiles + " file, " + CopyEstimator.FormatBytes(state.CopiedBytes)
+                    + " sudah tersalin)";
             }
         }
 
@@ -85,6 +203,7 @@ namespace FSO.Android
         /// </summary>
         private void ShowSetupScreen()
         {
+            _setupShown = true;
             var density = Resources.DisplayMetrics.Density;
             int pad = (int)(24 * density);
 
@@ -108,15 +227,47 @@ namespace FSO.Android
                 + "Cara 1: salin folder \"The Sims\" dari PC teman ke HP lewat USB/ADB, "
                 + "ke folder:\n" + GameFolderManager.AppGameRoot(this) + "\n"
                 + "lalu buka lagi aplikasi ini.\n\n"
-                + "Cara 2: salin folder \"The Sims\" ke HP (mis. ke Download), "
-                + "lalu pilih folder itu di bawah ini. Aplikasi akan menyalinnya "
-                + "ke storage aplikasi (butuh ruang kosong sekitar 3 GB).";
+                + "Cara 2: folder \"The Sims\" sudah ada di HP (mis. di Download atau "
+                + "IDM/Download) — pilih folder itu di bawah ini. Bila memungkinkan, "
+                + "aplikasi akan memakainya LANGSUNG tanpa menyalin (paling cepat). "
+                + "Bila tidak, aplikasi menyalinnya — penyalinan tetap jalan walau "
+                + "aplikasi diminimalkan, dengan notifikasi progres.";
             layout.AddView(info);
 
             _pickButton = new Button(this);
             _pickButton.Text = "Pilih Folder Game";
-            _pickButton.Click += (sender, args) => PickFolder();
+            _pickButton.Click += (sender, args) => PickFolder(RequestPickGameFolder);
             layout.AddView(_pickButton);
+
+            _resumeButton = new Button(this);
+            _resumeButton.Text = "Lanjutkan Penyalinan";
+            _resumeButton.Visibility = ViewStates.Gone;
+            _resumeButton.Click += (sender, args) =>
+            {
+                FileLogger.Log("COPY", "Lanjutkan penyalinan diminta dari layar setup");
+                RequestNotificationPermission();
+                CopyForegroundService.ResumeCopy(this);
+                _resumeButton.Visibility = ViewStates.Gone;
+                if (_cancelButton != null) _cancelButton.Visibility = ViewStates.Visible;
+                if (_setupStatus != null) _setupStatus.Text = "Melanjutkan penyalinan...";
+            };
+            layout.AddView(_resumeButton);
+
+            _cancelButton = new Button(this);
+            _cancelButton.Text = "Batal";
+            _cancelButton.Visibility = ViewStates.Gone;
+            _cancelButton.Click += (sender, args) =>
+            {
+                FileLogger.Log("COPY", "Batal diminta dari layar setup");
+                CopyForegroundService.CancelCopy(this);
+                _cancelButton.Visibility = ViewStates.Gone;
+            };
+            layout.AddView(_cancelButton);
+
+            _logButton = new Button(this);
+            _logButton.Text = "Lihat Log";
+            _logButton.Click += (sender, args) => ShowLogDialog();
+            layout.AddView(_logButton);
 
             _setupStatus = new TextView(this);
             _setupStatus.SetTextSize(ComplexUnitType.Sp, 14);
@@ -124,21 +275,116 @@ namespace FSO.Android
             layout.AddView(_setupStatus);
 
             SetContentView(layout);
+            RefreshResumeButton();
+        }
+
+        /// <summary>Dialog "Lihat Log": isi file log .txt + tombol simpan ke file .txt.</summary>
+        private void ShowLogDialog()
+        {
+            var scroll = new ScrollView(this);
+            var text = new TextView(this);
+            text.SetTextSize(ComplexUnitType.Sp, 13);
+            text.Text = FileLogger.ReadTail(20000)
+                + "\n\nLokasi file log:\n" + (FileLogger.LogPath ?? "(belum dibuat)");
+            scroll.AddView(text);
+
+            var builder = new AlertDialog.Builder(this);
+            builder.SetTitle("Log Blueberry FreeSO (.txt)");
+            builder.SetView(scroll);
+            builder.SetPositiveButton("Simpan Log (.txt)", (sender, args) =>
+            {
+                var intent = new Intent(Intent.ActionCreateDocument);
+                intent.AddCategory(Intent.CategoryOpenable);
+                intent.SetType("text/plain");
+                intent.PutExtra(Intent.ExtraTitle, FileLogger.LogFileName);
+                StartActivityForResult(intent, RequestSaveLog);
+            });
+            builder.SetNegativeButton("Tutup", (sender, args) => { });
+            builder.Show();
         }
 
         /// <summary>Buka pemilih folder sistem (Storage Access Framework).</summary>
-        private void PickFolder()
+        private void PickFolder(int requestCode)
         {
             var intent = new Intent(Intent.ActionOpenDocumentTree);
             intent.AddFlags(ActivityFlags.GrantReadUriPermission
                 | ActivityFlags.GrantPersistableUriPermission
                 | ActivityFlags.GrantPrefixUriPermission);
-            StartActivityForResult(intent, RequestPickGameFolder);
+            StartActivityForResult(intent, requestCode);
+        }
+
+        /// <summary>
+        /// Minta izin POST_NOTIFICATIONS (Android 13+) supaya notifikasi progres
+        /// tampil. Best-effort: notifikasi foreground service tetap tampil walau
+        /// izin ini ditolak, jadi tidak menunggu hasilnya.
+        /// </summary>
+        private void RequestNotificationPermission()
+        {
+            if (Build.VERSION.SdkInt >= BuildVersionCodes.Tiramisu
+                && CheckSelfPermission(global::Android.Manifest.Permission.PostNotifications)
+                    != Permission.Granted)
+            {
+                RequestPermissions(
+                    new[] { global::Android.Manifest.Permission.PostNotifications },
+                    RequestPostNotifications);
+            }
         }
 
         protected override void OnActivityResult(int requestCode, Result resultCode, Intent data)
         {
             base.OnActivityResult(requestCode, resultCode, data);
+
+            if (requestCode == RequestSaveLog)
+            {
+                if (resultCode == Result.Ok && data?.Data != null)
+                {
+                    try
+                    {
+                        using var output = ContentResolver.OpenOutputStream(data.Data);
+                        if (output == null) throw new IOException("Tidak bisa membuka file tujuan.");
+                        var bytes = System.Text.Encoding.UTF8.GetBytes(FileLogger.ReadTail(int.MaxValue));
+                        output.Write(bytes, 0, bytes.Length);
+                        Toast.MakeText(this, "Log tersimpan.", ToastLength.Short).Show();
+                        FileLogger.Log("APP", "Log diekspor oleh user ke " + data.Data);
+                    }
+                    catch (Exception e)
+                    {
+                        FileLogger.LogError("APP", e);
+                        Toast.MakeText(this, "Gagal menyimpan log: " + e.Message, ToastLength.Long).Show();
+                    }
+                }
+                return;
+            }
+
+            if (requestCode == RequestPickDestFolder)
+            {
+                if (resultCode != Result.Ok || data?.Data == null)
+                {
+                    _setupStatus.Text = "Pemilihan folder tujuan dibatalkan — memakai storage aplikasi.";
+                    StartCopyToAppStorage();
+                    return;
+                }
+                var destTreeUri = data.Data;
+                var destReal = GameFolderManager.ResolveRealPath(this, destTreeUri);
+                if (destReal == null)
+                {
+                    _setupStatus.Text = "Folder tujuan itu tidak bisa dipakai (jalur nyatanya "
+                        + "tidak terbaca). Memakai storage aplikasi sebagai gantinya.";
+                    FileLogger.Log("COPY", "Folder tujuan custom tidak bisa diurai jalurnya: " + destTreeUri);
+                    StartCopyToAppStorage();
+                    return;
+                }
+                if (!GameFolderManager.HasAllFilesAccess(this))
+                {
+                    ShowNeedAllFilesAccess(
+                        "Menyalin ke folder pilihan butuh izin \"akses semua file\".");
+                    return;
+                }
+                StartCopy(_pendingSourceUri, _pendingSourceRealPath,
+                    Path.Combine(destReal, "The Sims"));
+                return;
+            }
+
             if (requestCode != RequestPickGameFolder) return;
 
             if (resultCode != Result.Ok || data?.Data == null)
@@ -166,63 +412,178 @@ namespace FSO.Android
             catch (Exception e)
             {
                 Log.Warn(LogTag, "TakePersistableUriPermission gagal: " + e.Message);
+                FileLogger.Log("SAF", "TakePersistableUriPermission gagal: " + e.Message);
             }
-            StartCopyFromTree(treeUri);
+            HandlePickedGameFolder(treeUri);
         }
 
         /// <summary>
-        /// Validasi folder yang dipilih, lalu salin isinya ke storage aplikasi
-        /// di thread latar (supaya layar tidak beku), dengan progress.
+        /// Folder game dipilih: validasi dulu, lalu tawarkan cara memakainya
+        /// (langsung / salin ke storage aplikasi / salin ke Download /
+        /// salin ke folder lain). Validasi lewat jalur nyata bila bisa diurai
+        /// (cepat), lewat SAF bila tidak.
         /// </summary>
-        private async void StartCopyFromTree(global::Android.Net.Uri treeUri)
+        private async void HandlePickedGameFolder(global::Android.Net.Uri treeUri)
         {
             _pickButton.Enabled = false;
             _setupStatus.Text = "Memeriksa folder game...";
+            FileLogger.Log("SETUP", "Folder dipilih: " + treeUri);
             try
             {
-                var validation = await Task.Run(
-                    () => GameFolderManager.ValidateTree(this, treeUri));
+                var realPath = GameFolderManager.ResolveRealPath(this, treeUri);
+                GameFolderValidation validation;
+                if (realPath != null)
+                {
+                    validation = await Task.Run(() => GameFolderValidator.Validate(realPath));
+                }
+                else
+                {
+                    validation = await Task.Run(
+                        () => GameFolderManager.ValidateTree(this, treeUri));
+                }
                 if (!validation.IsValid)
                 {
+                    FileLogger.Log("SETUP", "Folder tidak valid: "
+                        + string.Join(", ", validation.MissingFiles));
                     _setupStatus.Text = "Folder tidak valid.\n\n" + validation.UserMessage;
                     _pickButton.Enabled = true;
                     return;
                 }
+                FileLogger.Log("SETUP", "Folder valid"
+                    + (realPath != null ? " (jalur nyata: " + realPath + ")" : " (SAF)"));
 
-                var dest = GameFolderManager.AppGameRoot(this);
-                _setupStatus.Text = "Menyalin file game... 0%";
-                var progress = new Progress<GameFolderCopyProgress>(p =>
-                {
-                        _setupStatus.Text = "Menyalin file game... " + p.Percent + "%"
-                        + " (" + p.CopiedFiles + "/" + p.TotalFiles + " file)\n" + p.CurrentFile;
-                });
-                await GameFolderManager.CopyTreeAsync(
-                    this, treeUri, dest, progress, CancellationToken.None);
-
-                var check = GameFolderValidator.Validate(dest);
-                if (!check.IsValid)
-                {
-                    _setupStatus.Text = "Salinan tidak lengkap, file ini hilang:\n- "
-                        + string.Join("\n- ", check.MissingFiles)
-                        + "\n\nCoba pilih folder game lagi.";
-                    _pickButton.Enabled = true;
-                    return;
-                }
-
-                GameFolderManager.SaveGameFolder(this, dest, treeUri.ToString());
-                RunGame(dest);
+                _pendingSourceUri = treeUri;
+                _pendingSourceRealPath = realPath;
+                ShowUseChoiceDialog(treeUri, realPath);
             }
             catch (Exception e)
             {
-                Log.Error(LogTag, "Setup folder game gagal: " + e);
-                _setupStatus.Text = "Gagal menyalin folder game:\n" + e.Message
-                    + "\n\nCoba lagi.";
+                // Error di fase awal (validasi) JANGAN diam — tampilkan di layar
+                // + catat ke log. Inilah yang hilang di Langkah 5 (stuck di 0%
+                // tanpa pesan).
+                Log.Error(LogTag, "Validasi folder game gagal: " + e);
+                FileLogger.LogError("SETUP", e);
+                _setupStatus.Text = "Gagal memeriksa folder game:\n" + e.Message
+                    + "\n\nCoba lagi, atau lihat Log untuk detail.";
                 _pickButton.Enabled = true;
             }
         }
 
+        /// <summary>Dialog pilihan cara memakai folder game yang sudah tervalidasi.</summary>
+        private void ShowUseChoiceDialog(global::Android.Net.Uri treeUri, string realPath)
+        {
+            var items = new[]
+            {
+                "Pakai folder ini langsung (tanpa menyalin — paling cepat)",
+                "Salin ke storage aplikasi (bawaan)",
+                "Salin ke Download/BlueberryFreeSO",
+                "Salin ke folder lain... (pilih)",
+            };
+            var builder = new AlertDialog.Builder(this);
+            builder.SetTitle("Folder game valid — mau dipakai bagaimana?");
+            builder.SetItems(items, (sender, args) =>
+            {
+                switch (args.Which)
+                {
+                    case 0: UseDirectly(treeUri); break;
+                    case 1: StartCopyToAppStorage(); break;
+                    case 2:
+                        if (!GameFolderManager.HasAllFilesAccess(this))
+                        {
+                            ShowNeedAllFilesAccess(
+                                "Menyalin ke Download butuh izin \"akses semua file\".");
+                            break;
+                        }
+                        StartCopy(treeUri, realPath, GameFolderManager.SharedDownloadRoot());
+                        break;
+                    default:
+                        _setupStatus.Text = "Pilih folder tujuan salinan...";
+                        PickFolder(RequestPickDestFolder);
+                        break;
+                }
+            });
+            builder.SetNegativeButton("Batal", (sender, args) =>
+            {
+                _pickButton.Enabled = true;
+                _setupStatus.Text = "";
+            });
+            builder.Show();
+        }
+
+        /// <summary>Dialog penjelas saat izin "akses semua file" belum diberikan.</summary>
+        private void ShowNeedAllFilesAccess(string reason)
+        {
+            var builder = new AlertDialog.Builder(this);
+            builder.SetTitle("Butuh izin akses semua file");
+            builder.SetMessage(reason + "\n\nDi halaman Settings yang terbuka, nyalakan "
+                + "\"Izinkan pengelolaan semua file\" untuk Blueberry FreeSO, lalu kembali "
+                + "ke aplikasi dan pilih folder game lagi.");
+            builder.SetPositiveButton("Buka Settings", (sender, args) =>
+            {
+                FileLogger.Log("APP", "Membuka Settings akses semua file");
+                GameFolderManager.RequestAllFilesAccess(this);
+                _pickButton.Enabled = true;
+            });
+            builder.SetNegativeButton("Salin ke storage aplikasi", (sender, args) =>
+            {
+                StartCopyToAppStorage();
+            });
+            builder.Show();
+        }
+
+        /// <summary>Mode langsung: pakai folder game di tempatnya tanpa menyalin.</summary>
+        private void UseDirectly(global::Android.Net.Uri treeUri)
+        {
+            var (path, error) = GameFolderManager.TryUseDirectly(this, treeUri);
+            if (path != null)
+            {
+                _setupStatus.Text = "Memakai folder game langsung:\n" + path;
+                GameFolderManager.SaveGameFolder(this, path, treeUri.ToString());
+                RunGame(path);
+                return;
+            }
+            // Gagal: bila karena izin, tawarkan buka Settings; bila karena
+            // alasan lain, tampilkan errornya dengan jelas.
+            FileLogger.Log("DIRECT", "Gagal pakai langsung: " + error);
+            if (error.Contains("akses semua file"))
+            {
+                ShowNeedAllFilesAccess(error);
+            }
+            else
+            {
+                _setupStatus.Text = "Tidak bisa dipakai langsung:\n" + error
+                    + "\n\nPilih \"Salin\" untuk menyalin isinya ke storage aplikasi.";
+                _pickButton.Enabled = true;
+            }
+        }
+
+        private void StartCopyToAppStorage()
+        {
+            StartCopy(_pendingSourceUri, _pendingSourceRealPath,
+                GameFolderManager.AppGameRoot(this));
+        }
+
+        /// <summary>
+        /// Mulai penyalinan lewat foreground service (tetap jalan walau aplikasi
+        /// diminimalkan, dengan notifikasi progres + tombol Batal di notifikasi).
+        /// </summary>
+        private void StartCopy(global::Android.Net.Uri sourceUri, string sourceRealPath, string destPath)
+        {
+            _pickButton.Enabled = false;
+            if (_resumeButton != null) _resumeButton.Visibility = ViewStates.Gone;
+            if (_cancelButton != null) _cancelButton.Visibility = ViewStates.Visible;
+            _setupStatus.Text = "Memulai penyalinan...\nTujuan: " + destPath;
+            FileLogger.Log("COPY", "Mulai salin: sumber=" + (sourceRealPath ?? sourceUri.ToString())
+                + " tujuan=" + destPath);
+            RequestNotificationPermission();
+            CopyForegroundService.StartCopy(this,
+                sourceUri?.ToString(), sourceRealPath, destPath);
+        }
+
         private void RunGame(string gameFolder)
         {
+            if (_gameStarted) return;
+            _gameStarted = true;
             // --- 1. DPI / zoom UI, pola FSODroid ---
             // HP kecil: UI diperbesar supaya tombol tidak terlalu kecil.
             var disp = Resources.DisplayMetrics;

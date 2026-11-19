@@ -22,7 +22,7 @@ namespace FSO.Android
     /// Thread-safe (satu lock), dan kegagalan menulis log tidak pernah
     /// melempar exception ke pemanggil (log tidak boleh mematikan aplikasi).
     /// </summary>
-    public static class FileLogger
+    public static partial class FileLogger
     {
         public const string LogFileName = "BlueberryFreeSO-log.txt";
 

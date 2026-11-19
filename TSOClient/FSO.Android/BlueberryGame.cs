@@ -31,10 +31,17 @@ namespace FSO.Android
     {
         protected override void Initialize()
         {
+            // Log tahap (perbaikan 5.2, diagnosis blackscreen): Initialize() jalan
+            // sinkron di UI thread sebelum frame pertama — bila layar hitam,
+            // baris terakhir di log menunjukkan tahap mana yang belum selesai.
+            FileLogger.Log("RUN", "BlueberryGame.Initialize: sebelum base.Initialize()");
             base.Initialize();
+            FileLogger.Log("RUN", "BlueberryGame.Initialize: base selesai, Target dibalik ke TS1");
             // Content.Target di sini adalah FSO.Content.Content (kelas statis engine),
             // BUKAN Game.Content (ContentManager MonoGame — properti turunan dari Game).
             FSO.Content.Content.Target = FSOEngineMode.TS1;
+            FileLogger.Log("RUN", "BlueberryGame.Initialize: selesai, LoadProgress="
+                + FSO.Content.Content.LoadProgress);
         }
     }
 }

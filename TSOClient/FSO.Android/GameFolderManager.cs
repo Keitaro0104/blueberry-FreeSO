@@ -88,7 +88,12 @@ namespace FSO.Android
             var editor = context.GetSharedPreferences(PrefsName, FileCreationMode.Private).Edit();
             editor.PutString(KeyGameFolderPath, path);
             if (sourceUri != null) editor.PutString(KeyGameFolderSourceUri, sourceUri);
-            editor.Apply();
+            // Commit (sinkron), bukan Apply (async): folder game adalah state
+            // yang paling penting — salinan selesai lalu game langsung jalan,
+            // dan bila proses mati (crash native) sedetik kemudian, tulis async
+            // bisa hilang sehingga buka berikutnya menampilkan setup lagi.
+            // File prefs ini kecil, jadi Commit tidak terasa lambat.
+            editor.Commit();
         }
 
         // ------------------------------------------------------------------

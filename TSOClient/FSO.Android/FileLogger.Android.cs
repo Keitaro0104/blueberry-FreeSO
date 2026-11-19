@@ -18,6 +18,13 @@ namespace FSO.Android
     /// Bila sudah ada file lama dengan nama sama, dihapus dulu lewat
     /// query + delete (best-effort) supaya di Download tinggal satu file log.
     ///
+    /// Perbaikan 5.3: nama kolom MediaStore HARUS lewat konstanta
+    /// MediaStore.MediaColumns ("_display_name", bukan "display_name") —
+    /// string mentah "display_name" ditolak provider Downloads dengan
+    /// "Invalid column display_name" (log HP 21:37 WITA, export gagal 2x).
+    /// Selection query juga tidak boleh memakai display_name — hapus file
+    /// lama memakai query tanpa selection + saring di kode (OldLogFileIds).
+    ///
     /// Android lama (&lt; API 29): tulis langsung ke
     /// /storage/emulated/0/Download/ (izin WRITE_EXTERNAL_STORAGE maxSdk 28
     /// sudah ada di manifest).
@@ -59,18 +66,28 @@ namespace FSO.Android
                     var collection = MediaStore.Downloads.ExternalContentUri;
 
                     // Hapus file lama dengan nama sama (best-effort).
+                    // Perbaikan 5.3: selection "display_name = ?" DITOLAK
+                    // provider Downloads ("Invalid column display_name" di
+                    // log HP 21:37) — dan nama kolom yang benar adalah
+                    // "_display_name", bukan "display_name". Jadi query TANPA
+                    // selection (semua baris Download), lalu saring nama di
+                    // kode C# lewat helper murni OldLogFileIds, dan hapus
+                    // berdasarkan _id.
                     try
                     {
                         using var cursor = resolver.Query(collection,
-                            new[] { "_id" }, "display_name = ?",
-                            new[] { LogFileName }, null);
+                            new[] { MediaStore.MediaColumns.Id, MediaStore.MediaColumns.DisplayName },
+                            null, null, null);
                         if (cursor != null)
                         {
-                            int idCol = cursor.GetColumnIndex("_id");
+                            int idCol = cursor.GetColumnIndex(MediaStore.MediaColumns.Id);
+                            int nameCol = cursor.GetColumnIndex(MediaStore.MediaColumns.DisplayName);
+                            var rows = new System.Collections.Generic.List<(long, string)>();
                             while (cursor.MoveToNext())
+                                rows.Add((cursor.GetLong(idCol), cursor.GetString(nameCol)));
+                            foreach (var id in OldLogFileIds(rows))
                             {
-                                var oldUri = ContentUris.WithAppendedId(
-                                    collection, cursor.GetLong(idCol));
+                                var oldUri = ContentUris.WithAppendedId(collection, id);
                                 try { resolver.Delete(oldUri, null, null); }
                                 catch (Exception) { }
                             }
@@ -78,10 +95,14 @@ namespace FSO.Android
                     }
                     catch (Exception) { /* lanjut — insert baru tetap dicoba */ }
 
+                    // Perbaikan 5.3: pakai konstanta MediaStore — string mentah
+                    // "display_name" BUKAN nama kolom ("_display_name"), insert
+                    // menolaknya dengan "Invalid column display_name".
                     var values = new ContentValues();
-                    values.Put("display_name", LogFileName);
-                    values.Put("mime_type", "text/plain");
-                    values.Put("relative_path", global::Android.OS.Environment.DirectoryDownloads);
+                    values.Put(MediaStore.MediaColumns.DisplayName, LogFileName);
+                    values.Put(MediaStore.MediaColumns.MimeType, "text/plain");
+                    values.Put(MediaStore.MediaColumns.RelativePath,
+                        global::Android.OS.Environment.DirectoryDownloads);
                     var uri = resolver.Insert(collection, values);
                     if (uri == null) return false;
                     using var output = resolver.OpenOutputStream(uri);

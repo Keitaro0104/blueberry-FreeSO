@@ -9,7 +9,9 @@ namespace FSO.Android
     /// Pengganti WindowsLocator (Registry + kernel32.dll) dan LinuxLocator untuk Android.
     ///
     /// Urutan pencarian:
-    /// 1. Folder yang tersimpan di SharedPreferences (hasil pemilih folder Langkah 5).
+    /// 1. Folder yang tersimpan di SharedPreferences (hasil pemilih folder Langkah 5
+    ///    — bisa berupa salinan di storage aplikasi, folder custom di penyimpanan
+    ///    bersama, atau folder game yang dipakai langsung tanpa menyalin).
     /// 2. Folder `{GetExternalFilesDir}/The Sims` — tempat file game disalin lewat
     ///    USB/ADB dari PC teman (pola davius: adb push ke
     ///    /sdcard/Android/data/com.keitaro0104.blueberryfreeso/files/The Sims/).

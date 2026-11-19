@@ -2,5 +2,23 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.keitaro0104.blueberryfreeso" android:versionCode="1" android:versionName="1.0">
   <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="35" />
   <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+  <!--
+    Izin penyalinan latar belakang + notifikasi (perbaikan Langkah 5.1):
+    - FOREGROUND_SERVICE + FOREGROUND_SERVICE_DATA_SYNC: penyalinan jalan
+      sebagai foreground service bertipe dataSync (Android 14+ wajib
+      mendeklarasikan tipe + izinnya).
+    - POST_NOTIFICATIONS: izin tampilkan notifikasi progres (Android 13+;
+      notifikasi foreground service sendiri tetap tampil walau izin ini ditolak).
+    - MANAGE_EXTERNAL_STORAGE: "akses semua file" — syarat mode "pakai folder
+      langsung" (membaca file .iff di penyimpanan bersama lewat jalur nyata,
+      mis. /storage/emulated/0/IDM/Download/The Sims). Diminta lewat Settings.
+    - READ_EXTERNAL_STORAGE: Android lama (<=12) sebagai gantinya.
+  -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
   <application android:label="Blueberry FreeSO"></application>
 </manifest>
